@@ -35,6 +35,10 @@ from tha3.util import torch_linear_to_srgb, resize_PIL_image, extract_PIL_image_
 
 import collections
 
+from threading import Thread
+import wave
+import pyaudio
+
 
 def convert_linear_to_srgb(image: torch.Tensor) -> torch.Tensor:
     rgb_image = torch_linear_to_srgb(image[0:3, :, :])
@@ -523,6 +527,117 @@ class ModelClientProcess(Process):
                 self.cache_hit_ratio.value = hit / tot
 
 
+ret_volume_queue = [0.0]
+ret_phrase_queue = ['']
+mouth_cues_index = 0
+frame = 0
+vowel = ''
+volume = 0.0
+
+
+class Wav2MouthThread(Thread):
+    def __init__(self):
+        Thread.__init__(self)
+
+    def run(self):
+        wave_path = "data/audio/test.wav"
+        lips_path = "data/lips/test.json"
+
+        with open(lips_path, encoding='utf-8') as f:
+            data = json.load(f)
+        duration = data['metadata']['duration']
+        print(duration)
+        mouth_cues = data['mouthCues']
+
+        time.sleep(20)
+        wf = wave.open(wave_path, 'rb')
+
+        rate = wf.getframerate()
+        print(rate)
+
+        def callback(in_data, frame_count, time_info, status):
+            global frame
+            global mouth_cues_index
+            global vowel
+            global volume
+
+            t = frame / rate
+            print(f"current time: {t}")
+
+            while mouth_cues_index < len(mouth_cues):
+                if t < mouth_cues[mouth_cues_index]['start']:
+                    break
+
+                # 如果逻辑走到这里，说明要刷新口型了
+                index = mouth_cues_index
+                print(mouth_cues[index]['start'])
+
+                next_index = index
+                while t >= mouth_cues[next_index]['start']:
+                    next_index += 1
+                    if next_index >= len(mouth_cues):
+                        break
+
+                index = next_index - 1
+                print(f"current index: {index}")
+                # 这里得到mouth_shape，用于口型表现
+                mouth_shape = mouth_cues[index]['value']
+                print(f"mouth shape: {mouth_shape}")
+
+                '''口型部分：'''
+                if "A" == mouth_shape:
+                    volume = 0.0
+                else:
+                    volume = 1.0
+                    if "B" == mouth_shape:
+                        vowel = 'i'
+                    elif "C" == mouth_shape:
+                        vowel = 'e'
+                    elif "D" == mouth_shape:
+                        vowel = 'a'
+                    elif "E" == mouth_shape:
+                        vowel = 'o'
+                    elif "F" == mouth_shape:
+                        vowel = 'u'
+
+                if len(ret_volume_queue) < 1:
+                    ret_volume_queue.append(volume)
+                else:  # 1长度
+                    ret_volume_queue.pop(0)
+                    ret_volume_queue.append(volume)
+
+                if len(ret_phrase_queue) < 1:
+                    ret_phrase_queue.append(vowel)
+                else:  # 1长度
+                    ret_phrase_queue.pop(0)
+                    ret_phrase_queue.append(vowel)
+
+                mouth_cues_index = next_index
+
+            frame += frame_count
+
+            data = wf.readframes(frame_count)
+            return (data, pyaudio.paContinue)
+
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pa.get_format_from_width(wf.getsampwidth()),
+                         channels=wf.getnchannels(),
+                         rate=wf.getframerate(),
+                         output=True,
+                         stream_callback=callback)
+
+        stream.start_stream()
+        while stream.is_active():
+            sleep_time = 0.1
+            time.sleep(sleep_time)
+        ret_phrase_queue[0] = ''
+        ret_volume_queue[0] = 0
+        stream.stop_stream()
+        stream.close()
+        wf.close()
+        pa.terminate()
+
+
 @torch.no_grad()
 def main():
     img = Image.open(f"data/images/{args.character}.png")
@@ -645,10 +760,33 @@ def main():
 
     print("Ready. Close this console to exit.")
 
+    mouth_ratio_lip = 0
+    mouth_shape_lip = 14
+
+    wav_2_mouth_thread = Wav2MouthThread()
+    wav_2_mouth_thread.daemon = True
+    wav_2_mouth_thread.start()
+
     while True:
         # ret, frame = cap.read()
         # input_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # results = facemesh.process(input_frame)
+        mouth_ratio_lip = ret_volume_queue[0]
+        if "a" == ret_phrase_queue[0]:
+            mouth_shape_lip = 14
+        elif "e" == ret_phrase_queue[0]:
+            mouth_shape_lip = 17
+        elif "i" == ret_phrase_queue[0]:
+            mouth_shape_lip = 15
+        elif "o" == ret_phrase_queue[0]:
+            mouth_shape_lip = 18
+        elif "u" == ret_phrase_queue[0]:
+            mouth_shape_lip = 16
+        else:
+            mouth_shape_lip = 19
+
+        # mouth_ratio_lip = 1
+        # mouth_shape_lip = 20
 
         if args.perf == 'main':
             tic = time.perf_counter()
@@ -775,7 +913,8 @@ def main():
 
             eye_l_h_temp = mouse_data['eye_l_h_temp']
             eye_r_h_temp = mouse_data['eye_r_h_temp']
-            mouth_ratio = mouse_data['mouth_ratio']
+            # mouth_ratio = mouse_data['mouth_ratio']
+            mouth_ratio = mouth_ratio_lip
             eye_y_ratio = mouse_data['eye_y_ratio']
             eye_x_ratio = mouse_data['eye_x_ratio']
             x_angle = mouse_data['x_angle']
@@ -789,7 +928,8 @@ def main():
             mouth_eye_vector_c[2] = eye_l_h_temp
             mouth_eye_vector_c[3] = eye_r_h_temp
 
-            mouth_eye_vector_c[14] = mouth_ratio * 1.5
+            # mouth_eye_vector_c[14] = mouth_ratio * 1.5
+            mouth_eye_vector_c[mouth_shape_lip] = mouth_ratio * 1.5 # 14 #★a 15i 16u 17e 18o 19△d
 
             mouth_eye_vector_c[25] = eye_y_ratio
             mouth_eye_vector_c[26] = eye_x_ratio
